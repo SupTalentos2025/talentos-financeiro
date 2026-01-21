@@ -184,7 +184,7 @@ function LoginPage({ onAuthSuccess }) {
               <Target className="h-8 w-8 text-white" />
             </div>
           </div>
-          <CardTitle className="text-2xl">GestãoPro</CardTitle>
+          <CardTitle className="text-2xl">FinanceFlow</CardTitle>
           <CardDescription>Sistema de Gestão Multi-Empresas</CardDescription>
         </CardHeader>
         <CardContent>
@@ -605,7 +605,7 @@ function Dashboard({ user, onLogout }) {
             <div className="p-2 rounded-lg bg-blue-600">
               <Target className="h-5 w-5 text-white" />
             </div>
-            <span className="font-bold text-lg">GestãoPro</span>
+            <span className="font-bold text-lg">FinanceFlow</span>
           </div>
           <Button variant="ghost" size="icon" className="lg:hidden" onClick={() => setSidebarOpen(false)}>
             <X className="h-5 w-5" />
@@ -715,7 +715,7 @@ function Dashboard({ user, onLogout }) {
               </Button>
               <div>
                 <h1 className="text-xl font-bold">
-                  {activeTab === "companies" ? "Minhas Empresas" : selectedCompany?.name || "GestãoPro"}
+                  {activeTab === "companies" ? "Minhas Empresas" : selectedCompany?.name || "FinanceFlow"}
                 </h1>
                 {selectedCompany && activeTab !== "companies" && (
                   <p className="text-xs text-muted-foreground">CNPJ: {selectedCompany.cnpj}</p>
