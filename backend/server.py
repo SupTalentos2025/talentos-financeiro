@@ -1,15 +1,19 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Query, Response, Request, Depends
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
 from enum import Enum
+import bcrypt
+import jwt
+import httpx
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -19,25 +23,55 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
+# JWT Settings
+JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production-' + str(uuid.uuid4()))
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_DAYS = 7
+
 # Create the main app without a prefix
 app = FastAPI(title="Sistema de Gestão de Vendas")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
-# Enums
-class BillStatus(str, Enum):
-    PENDING = "pending"  # A Pagar
-    PAID = "paid"  # Paga
+# ============ AUTH MODELS ============
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
 
-# Models
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class User(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    user_id: str
+    email: str
+    name: str
+    picture: Optional[str] = None
+    auth_provider: str = "email"  # "email" or "google"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class UserResponse(BaseModel):
+    user_id: str
+    email: str
+    name: str
+    picture: Optional[str] = None
+
+# ============ BUSINESS MODELS ============
+class BillStatus(str, Enum):
+    PENDING = "pending"
+    PAID = "paid"
+
 class Product(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
     price: float
-    cost: float = 0.0  # Custo do produto
+    cost: float = 0.0
     stock: int = 0
+    user_id: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class ProductCreate(BaseModel):
@@ -54,7 +88,8 @@ class Sale(BaseModel):
     quantity: int
     unit_price: float
     total: float
-    profit: float = 0.0  # Lucro da venda
+    profit: float = 0.0
+    user_id: str = ""
     date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -71,6 +106,7 @@ class Bill(BaseModel):
     status: BillStatus = BillStatus.PENDING
     due_date: datetime
     paid_date: Optional[datetime] = None
+    user_id: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class BillCreate(BaseModel):
@@ -85,7 +121,6 @@ class BillUpdate(BaseModel):
     status: Optional[BillStatus] = None
     due_date: Optional[datetime] = None
 
-# Response Models
 class DashboardStats(BaseModel):
     sales_today: float
     sales_month: float
@@ -106,6 +141,69 @@ class DailySales(BaseModel):
     total: float
     count: int
 
+# ============ AUTH HELPERS ============
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def create_jwt_token(user_id: str) -> str:
+    expires = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRATION_DAYS)
+    payload = {
+        "user_id": user_id,
+        "exp": expires,
+        "iat": datetime.now(timezone.utc)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_jwt_token(token: str) -> Optional[dict]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+async def get_current_user(request: Request) -> User:
+    """Get current user from session_token cookie or Authorization header"""
+    # Try cookie first
+    session_token = request.cookies.get("session_token")
+    
+    # Fallback to Authorization header
+    if not session_token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            session_token = auth_header.split(" ")[1]
+    
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Não autenticado")
+    
+    # Check session in database
+    session = await db.user_sessions.find_one({"session_token": session_token}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=401, detail="Sessão inválida")
+    
+    # Check expiry
+    expires_at = session.get("expires_at")
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Sessão expirada")
+    
+    # Get user
+    user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuário não encontrado")
+    
+    if isinstance(user.get('created_at'), str):
+        user['created_at'] = datetime.fromisoformat(user['created_at'])
+    
+    return User(**user)
+
 # Helper functions
 def get_start_of_day():
     now = datetime.now(timezone.utc)
@@ -125,58 +223,241 @@ def get_start_of_week():
 async def root():
     return {"message": "Sistema de Gestão de Vendas API", "version": "1.0.0"}
 
+# ============ AUTH ENDPOINTS ============
+@api_router.post("/auth/register")
+async def register(input: UserCreate, response: Response):
+    """Register new user with email and password"""
+    # Check if user exists
+    existing = await db.users.find_one({"email": input.email}, {"_id": 0})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email já cadastrado")
+    
+    # Create user
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    hashed_password = hash_password(input.password)
+    
+    user_doc = {
+        "user_id": user_id,
+        "email": input.email,
+        "name": input.name,
+        "password_hash": hashed_password,
+        "picture": None,
+        "auth_provider": "email",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.users.insert_one(user_doc)
+    
+    # Create session
+    session_token = f"session_{uuid.uuid4().hex}"
+    expires_at = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRATION_DAYS)
+    
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    
+    # Set cookie
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=JWT_EXPIRATION_DAYS * 24 * 60 * 60
+    )
+    
+    return {
+        "user_id": user_id,
+        "email": input.email,
+        "name": input.name,
+        "picture": None
+    }
+
+@api_router.post("/auth/login")
+async def login(input: UserLogin, response: Response):
+    """Login with email and password"""
+    user = await db.users.find_one({"email": input.email}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+    
+    if user.get("auth_provider") == "google":
+        raise HTTPException(status_code=400, detail="Esta conta usa login com Google")
+    
+    if not verify_password(input.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Email ou senha incorretos")
+    
+    # Create session
+    session_token = f"session_{uuid.uuid4().hex}"
+    expires_at = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRATION_DAYS)
+    
+    await db.user_sessions.insert_one({
+        "user_id": user["user_id"],
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    
+    # Set cookie
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=JWT_EXPIRATION_DAYS * 24 * 60 * 60
+    )
+    
+    return {
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "name": user["name"],
+        "picture": user.get("picture")
+    }
+
+@api_router.post("/auth/google/session")
+async def google_session(request: Request, response: Response):
+    """Exchange Google session_id for local session"""
+    body = await request.json()
+    session_id = body.get("session_id")
+    
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id é obrigatório")
+    
+    # Call Emergent Auth API
+    async with httpx.AsyncClient() as client:
+        try:
+            auth_response = await client.get(
+                "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+                headers={"X-Session-ID": session_id},
+                timeout=10.0
+            )
+            
+            if auth_response.status_code != 200:
+                raise HTTPException(status_code=401, detail="Sessão Google inválida")
+            
+            google_data = auth_response.json()
+        except httpx.RequestError:
+            raise HTTPException(status_code=500, detail="Erro ao validar sessão Google")
+    
+    email = google_data.get("email")
+    name = google_data.get("name")
+    picture = google_data.get("picture")
+    
+    # Check if user exists
+    existing_user = await db.users.find_one({"email": email}, {"_id": 0})
+    
+    if existing_user:
+        user_id = existing_user["user_id"]
+        # Update user info if needed
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": name, "picture": picture}}
+        )
+    else:
+        # Create new user
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        user_doc = {
+            "user_id": user_id,
+            "email": email,
+            "name": name,
+            "picture": picture,
+            "auth_provider": "google",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.users.insert_one(user_doc)
+    
+    # Create session
+    session_token = f"session_{uuid.uuid4().hex}"
+    expires_at = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRATION_DAYS)
+    
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    
+    # Set cookie
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=JWT_EXPIRATION_DAYS * 24 * 60 * 60
+    )
+    
+    return {
+        "user_id": user_id,
+        "email": email,
+        "name": name,
+        "picture": picture
+    }
+
+@api_router.get("/auth/me", response_model=UserResponse)
+async def get_me(current_user: User = Depends(get_current_user)):
+    """Get current authenticated user"""
+    return UserResponse(
+        user_id=current_user.user_id,
+        email=current_user.email,
+        name=current_user.name,
+        picture=current_user.picture
+    )
+
+@api_router.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    """Logout user and clear session"""
+    session_token = request.cookies.get("session_token")
+    
+    if session_token:
+        await db.user_sessions.delete_one({"session_token": session_token})
+    
+    response.delete_cookie(
+        key="session_token",
+        path="/",
+        secure=True,
+        samesite="none"
+    )
+    
+    return {"message": "Logout realizado com sucesso"}
+
 # ============ PRODUCTS ENDPOINTS ============
 @api_router.post("/products", response_model=Product)
-async def create_product(input: ProductCreate):
-    product = Product(**input.model_dump())
+async def create_product(input: ProductCreate, current_user: User = Depends(get_current_user)):
+    product = Product(**input.model_dump(), user_id=current_user.user_id)
     doc = product.model_dump()
     doc['created_at'] = doc['created_at'].isoformat()
     await db.products.insert_one(doc)
     return product
 
 @api_router.get("/products", response_model=List[Product])
-async def get_products():
-    products = await db.products.find({}, {"_id": 0}).to_list(500)
+async def get_products(current_user: User = Depends(get_current_user)):
+    products = await db.products.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(500)
     for p in products:
         if isinstance(p.get('created_at'), str):
             p['created_at'] = datetime.fromisoformat(p['created_at'])
     return products
 
-@api_router.get("/products/{product_id}", response_model=Product)
-async def get_product(product_id: str):
-    product = await db.products.find_one({"id": product_id}, {"_id": 0})
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
-    if isinstance(product.get('created_at'), str):
-        product['created_at'] = datetime.fromisoformat(product['created_at'])
-    return product
-
-@api_router.put("/products/{product_id}", response_model=Product)
-async def update_product(product_id: str, input: ProductCreate):
-    result = await db.products.update_one({"id": product_id}, {"$set": input.model_dump()})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Produto não encontrado")
-    product = await db.products.find_one({"id": product_id}, {"_id": 0})
-    if isinstance(product.get('created_at'), str):
-        product['created_at'] = datetime.fromisoformat(product['created_at'])
-    return product
-
 @api_router.delete("/products/{product_id}")
-async def delete_product(product_id: str):
-    result = await db.products.delete_one({"id": product_id})
+async def delete_product(product_id: str, current_user: User = Depends(get_current_user)):
+    result = await db.products.delete_one({"id": product_id, "user_id": current_user.user_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
     return {"message": "Produto excluído com sucesso"}
 
 # ============ SALES ENDPOINTS ============
 @api_router.post("/sales", response_model=Sale)
-async def create_sale(input: SaleCreate):
-    # Get product info
-    product = await db.products.find_one({"id": input.product_id}, {"_id": 0})
+async def create_sale(input: SaleCreate, current_user: User = Depends(get_current_user)):
+    product = await db.products.find_one({"id": input.product_id, "user_id": current_user.user_id}, {"_id": 0})
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
     
-    # Check stock
     if product.get('stock', 0) < input.quantity:
         raise HTTPException(status_code=400, detail="Estoque insuficiente")
     
@@ -190,6 +471,7 @@ async def create_sale(input: SaleCreate):
         unit_price=product['price'],
         total=total,
         profit=profit,
+        user_id=current_user.user_id,
         date=input.date or datetime.now(timezone.utc)
     )
     
@@ -199,7 +481,6 @@ async def create_sale(input: SaleCreate):
     
     await db.sales.insert_one(doc)
     
-    # Update stock
     await db.products.update_one(
         {"id": input.product_id},
         {"$inc": {"stock": -input.quantity}}
@@ -209,21 +490,12 @@ async def create_sale(input: SaleCreate):
 
 @api_router.get("/sales", response_model=List[Sale])
 async def get_sales(
+    current_user: User = Depends(get_current_user),
     limit: int = Query(100, ge=1, le=1000),
-    skip: int = Query(0, ge=0),
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    skip: int = Query(0, ge=0)
 ):
-    query = {}
-    if start_date or end_date:
-        query["date"] = {}
-        if start_date:
-            query["date"]["$gte"] = start_date
-        if end_date:
-            query["date"]["$lte"] = end_date
-    
     sales = await db.sales.find(
-        query, {"_id": 0}
+        {"user_id": current_user.user_id}, {"_id": 0}
     ).sort("date", -1).skip(skip).limit(limit).to_list(limit)
     
     for s in sales:
@@ -235,12 +507,11 @@ async def get_sales(
     return sales
 
 @api_router.delete("/sales/{sale_id}")
-async def delete_sale(sale_id: str):
-    sale = await db.sales.find_one({"id": sale_id}, {"_id": 0})
+async def delete_sale(sale_id: str, current_user: User = Depends(get_current_user)):
+    sale = await db.sales.find_one({"id": sale_id, "user_id": current_user.user_id}, {"_id": 0})
     if not sale:
         raise HTTPException(status_code=404, detail="Venda não encontrada")
     
-    # Restore stock
     await db.products.update_one(
         {"id": sale['product_id']},
         {"$inc": {"stock": sale['quantity']}}
@@ -251,8 +522,8 @@ async def delete_sale(sale_id: str):
 
 # ============ BILLS ENDPOINTS ============
 @api_router.post("/bills", response_model=Bill)
-async def create_bill(input: BillCreate):
-    bill = Bill(**input.model_dump())
+async def create_bill(input: BillCreate, current_user: User = Depends(get_current_user)):
+    bill = Bill(**input.model_dump(), user_id=current_user.user_id)
     doc = bill.model_dump()
     doc['due_date'] = doc['due_date'].isoformat()
     doc['created_at'] = doc['created_at'].isoformat()
@@ -262,8 +533,8 @@ async def create_bill(input: BillCreate):
     return bill
 
 @api_router.get("/bills", response_model=List[Bill])
-async def get_bills(status: Optional[BillStatus] = None):
-    query = {}
+async def get_bills(current_user: User = Depends(get_current_user), status: Optional[BillStatus] = None):
+    query = {"user_id": current_user.user_id}
     if status:
         query["status"] = status.value
     
@@ -279,39 +550,10 @@ async def get_bills(status: Optional[BillStatus] = None):
     
     return bills
 
-@api_router.put("/bills/{bill_id}", response_model=Bill)
-async def update_bill(bill_id: str, input: BillUpdate):
-    update_data = {k: v for k, v in input.model_dump().items() if v is not None}
-    
-    if not update_data:
-        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
-    
-    # If marking as paid, set paid_date
-    if update_data.get('status') == BillStatus.PAID:
-        update_data['paid_date'] = datetime.now(timezone.utc).isoformat()
-    
-    if update_data.get('due_date'):
-        update_data['due_date'] = update_data['due_date'].isoformat()
-    
-    result = await db.bills.update_one({"id": bill_id}, {"$set": update_data})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Conta não encontrada")
-    
-    bill = await db.bills.find_one({"id": bill_id}, {"_id": 0})
-    if isinstance(bill.get('due_date'), str):
-        bill['due_date'] = datetime.fromisoformat(bill['due_date'])
-    if isinstance(bill.get('created_at'), str):
-        bill['created_at'] = datetime.fromisoformat(bill['created_at'])
-    if bill.get('paid_date') and isinstance(bill['paid_date'], str):
-        bill['paid_date'] = datetime.fromisoformat(bill['paid_date'])
-    
-    return bill
-
 @api_router.put("/bills/{bill_id}/pay")
-async def pay_bill(bill_id: str):
-    """Mark a bill as paid"""
+async def pay_bill(bill_id: str, current_user: User = Depends(get_current_user)):
     result = await db.bills.update_one(
-        {"id": bill_id},
+        {"id": bill_id, "user_id": current_user.user_id},
         {"$set": {
             "status": BillStatus.PAID.value,
             "paid_date": datetime.now(timezone.utc).isoformat()
@@ -322,21 +564,19 @@ async def pay_bill(bill_id: str):
     return {"message": "Conta marcada como paga"}
 
 @api_router.delete("/bills/{bill_id}")
-async def delete_bill(bill_id: str):
-    result = await db.bills.delete_one({"id": bill_id})
+async def delete_bill(bill_id: str, current_user: User = Depends(get_current_user)):
+    result = await db.bills.delete_one({"id": bill_id, "user_id": current_user.user_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Conta não encontrada")
     return {"message": "Conta excluída com sucesso"}
 
 # ============ DASHBOARD ENDPOINTS ============
 @api_router.get("/dashboard/stats", response_model=DashboardStats)
-async def get_dashboard_stats():
-    now = datetime.now(timezone.utc)
+async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
     start_of_day = get_start_of_day().isoformat()
     start_of_month = get_start_of_month().isoformat()
     
-    # Get all sales
-    sales = await db.sales.find({}, {"_id": 0}).to_list(10000)
+    sales = await db.sales.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(10000)
     
     sales_today = 0
     sales_today_count = 0
@@ -354,8 +594,7 @@ async def get_dashboard_stats():
             sales_month_count += 1
             profit_month += sale.get('profit', 0)
     
-    # Get bills
-    bills = await db.bills.find({}, {"_id": 0}).to_list(10000)
+    bills = await db.bills.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(10000)
     
     bills_to_pay = sum(b['amount'] for b in bills if b['status'] == BillStatus.PENDING.value)
     bills_paid_month = 0
@@ -366,7 +605,6 @@ async def get_dashboard_stats():
             if paid_date and paid_date >= start_of_month:
                 bills_paid_month += bill['amount']
     
-    # Calculate net profit (profit from sales - bills paid this month)
     net_profit = profit_month - bills_paid_month
     
     return DashboardStats(
@@ -380,11 +618,11 @@ async def get_dashboard_stats():
     )
 
 @api_router.get("/dashboard/top-products-week", response_model=List[TopProduct])
-async def get_top_products_week():
+async def get_top_products_week(current_user: User = Depends(get_current_user)):
     start_of_week = get_start_of_week().isoformat()
     
     sales = await db.sales.find(
-        {"date": {"$gte": start_of_week}},
+        {"user_id": current_user.user_id, "date": {"$gte": start_of_week}},
         {"_id": 0}
     ).to_list(10000)
     
@@ -405,11 +643,11 @@ async def get_top_products_week():
     return [TopProduct(**p) for p in sorted_products[:10]]
 
 @api_router.get("/dashboard/top-products-month", response_model=List[TopProduct])
-async def get_top_products_month():
+async def get_top_products_month(current_user: User = Depends(get_current_user)):
     start_of_month = get_start_of_month().isoformat()
     
     sales = await db.sales.find(
-        {"date": {"$gte": start_of_month}},
+        {"user_id": current_user.user_id, "date": {"$gte": start_of_month}},
         {"_id": 0}
     ).to_list(10000)
     
@@ -430,11 +668,11 @@ async def get_top_products_month():
     return [TopProduct(**p) for p in sorted_products[:10]]
 
 @api_router.get("/dashboard/daily-sales", response_model=List[DailySales])
-async def get_daily_sales(days: int = Query(7, ge=1, le=30)):
+async def get_daily_sales(current_user: User = Depends(get_current_user), days: int = Query(7, ge=1, le=30)):
     now = datetime.now(timezone.utc)
     result = []
     
-    sales = await db.sales.find({}, {"_id": 0}).to_list(10000)
+    sales = await db.sales.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(10000)
     
     for i in range(days - 1, -1, -1):
         day = now - timedelta(days=i)
@@ -458,35 +696,32 @@ async def get_daily_sales(days: int = Query(7, ge=1, le=30)):
     
     return result
 
-# ============ CLEAR DATA ENDPOINT ============
+# ============ DATA MANAGEMENT ENDPOINTS ============
 @api_router.post("/clear")
-async def clear_data():
-    """Clear all data from the database"""
-    await db.products.delete_many({})
-    await db.sales.delete_many({})
-    await db.bills.delete_many({})
+async def clear_data(current_user: User = Depends(get_current_user)):
+    """Clear all user data"""
+    await db.products.delete_many({"user_id": current_user.user_id})
+    await db.sales.delete_many({"user_id": current_user.user_id})
+    await db.bills.delete_many({"user_id": current_user.user_id})
     return {"message": "Todos os dados foram limpos"}
 
-# ============ SEED DATA ENDPOINT ============
 @api_router.post("/seed")
-async def seed_data():
-    """Seed sample data for testing"""
-    await db.products.delete_many({})
-    await db.sales.delete_many({})
-    await db.bills.delete_many({})
+async def seed_data(current_user: User = Depends(get_current_user)):
+    """Seed sample data for the current user"""
+    # Clear existing data
+    await db.products.delete_many({"user_id": current_user.user_id})
+    await db.sales.delete_many({"user_id": current_user.user_id})
+    await db.bills.delete_many({"user_id": current_user.user_id})
     
     now = datetime.now(timezone.utc)
     
     # Create products
     products = [
-        Product(name="Camiseta Básica", price=49.90, cost=20.00, stock=100),
-        Product(name="Calça Jeans", price=129.90, cost=50.00, stock=50),
-        Product(name="Tênis Esportivo", price=199.90, cost=80.00, stock=30),
-        Product(name="Boné", price=39.90, cost=15.00, stock=80),
-        Product(name="Meia Pack 3", price=29.90, cost=10.00, stock=200),
-        Product(name="Jaqueta", price=249.90, cost=100.00, stock=25),
-        Product(name="Shorts", price=79.90, cost=30.00, stock=60),
-        Product(name="Vestido", price=159.90, cost=60.00, stock=40),
+        Product(name="Camiseta Básica", price=49.90, cost=20.00, stock=100, user_id=current_user.user_id),
+        Product(name="Calça Jeans", price=129.90, cost=50.00, stock=50, user_id=current_user.user_id),
+        Product(name="Tênis Esportivo", price=199.90, cost=80.00, stock=30, user_id=current_user.user_id),
+        Product(name="Boné", price=39.90, cost=15.00, stock=80, user_id=current_user.user_id),
+        Product(name="Meia Pack 3", price=29.90, cost=10.00, stock=200, user_id=current_user.user_id),
     ]
     
     for p in products:
@@ -496,27 +731,13 @@ async def seed_data():
     
     # Create sample sales
     sales_data = [
-        # Today
         {"product": products[0], "qty": 5, "days_ago": 0},
         {"product": products[1], "qty": 2, "days_ago": 0},
         {"product": products[4], "qty": 10, "days_ago": 0},
-        {"product": products[3], "qty": 3, "days_ago": 0},
-        # Yesterday
         {"product": products[0], "qty": 8, "days_ago": 1},
         {"product": products[2], "qty": 3, "days_ago": 1},
-        {"product": products[5], "qty": 1, "days_ago": 1},
-        # This week
         {"product": products[0], "qty": 15, "days_ago": 2},
         {"product": products[1], "qty": 5, "days_ago": 3},
-        {"product": products[2], "qty": 4, "days_ago": 4},
-        {"product": products[6], "qty": 7, "days_ago": 5},
-        {"product": products[7], "qty": 3, "days_ago": 6},
-        # This month
-        {"product": products[0], "qty": 20, "days_ago": 10},
-        {"product": products[1], "qty": 8, "days_ago": 12},
-        {"product": products[3], "qty": 15, "days_ago": 15},
-        {"product": products[4], "qty": 25, "days_ago": 18},
-        {"product": products[5], "qty": 4, "days_ago": 20},
     ]
     
     for s_data in sales_data:
@@ -528,6 +749,7 @@ async def seed_data():
             unit_price=product.price,
             total=product.price * s_data['qty'],
             profit=(product.price - product.cost) * s_data['qty'],
+            user_id=current_user.user_id,
             date=now - timedelta(days=s_data['days_ago'])
         )
         doc = sale.model_dump()
@@ -539,10 +761,7 @@ async def seed_data():
     bills_data = [
         {"desc": "Aluguel Loja", "amount": 3500.00, "days_due": 5, "status": "pending"},
         {"desc": "Energia Elétrica", "amount": 450.00, "days_due": 10, "status": "pending"},
-        {"desc": "Internet", "amount": 150.00, "days_due": 15, "status": "pending"},
-        {"desc": "Fornecedor Roupas", "amount": 5000.00, "days_due": -5, "status": "paid"},
-        {"desc": "Contador", "amount": 800.00, "days_due": -10, "status": "paid"},
-        {"desc": "Água", "amount": 120.00, "days_due": -15, "status": "paid"},
+        {"desc": "Fornecedor", "amount": 2000.00, "days_due": -5, "status": "paid"},
     ]
     
     for b_data in bills_data:
@@ -551,7 +770,8 @@ async def seed_data():
             amount=b_data['amount'],
             status=BillStatus.PAID if b_data['status'] == 'paid' else BillStatus.PENDING,
             due_date=now + timedelta(days=b_data['days_due']),
-            paid_date=now + timedelta(days=b_data['days_due']) if b_data['status'] == 'paid' else None
+            paid_date=now + timedelta(days=b_data['days_due']) if b_data['status'] == 'paid' else None,
+            user_id=current_user.user_id
         )
         doc = bill.model_dump()
         doc['due_date'] = doc['due_date'].isoformat()
@@ -573,7 +793,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
