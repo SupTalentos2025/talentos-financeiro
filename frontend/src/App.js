@@ -164,14 +164,14 @@ function App() {
     }
   }, []);
 
-  // Seed data
-  const seedData = async () => {
+  // Clear data
+  const clearData = async () => {
     try {
       setLoading(true);
-      await axios.post(`${API}/seed`);
+      await axios.post(`${API}/clear`);
       await fetchData();
     } catch (error) {
-      console.error("Error seeding data:", error);
+      console.error("Error clearing data:", error);
     }
   };
 
