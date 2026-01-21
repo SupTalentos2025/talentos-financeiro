@@ -427,21 +427,27 @@ async def get_expenses_by_category():
     result.sort(key=lambda x: x.amount, reverse=True)
     return result
 
+# ============ CLEAR DATA ENDPOINT ============
+@api_router.post("/clear")
+async def clear_data():
+    """Clear all data from the database"""
+    await db.accounts.delete_many({})
+    await db.categories.delete_many({})
+    await db.transactions.delete_many({})
+    return {"message": "All data cleared successfully"}
+
 # ============ SEED DATA ENDPOINT ============
 @api_router.post("/seed")
 async def seed_data():
-    """Seed initial data for testing"""
+    """Seed initial data - clean version without demo categories"""
     # Clear existing data
     await db.accounts.delete_many({})
     await db.categories.delete_many({})
     await db.transactions.delete_many({})
     
-    # Create accounts
+    # Create basic accounts only
     accounts = [
-        Account(name="Conta Corrente", account_type=AccountType.CHECKING, balance=5000.00, color="#3B82F6", icon="building-columns"),
-        Account(name="Poupança", account_type=AccountType.SAVINGS, balance=15000.00, color="#10B981", icon="piggy-bank"),
-        Account(name="Cartão de Crédito", account_type=AccountType.CREDIT_CARD, balance=-2500.00, color="#EF4444", icon="credit-card"),
-        Account(name="Investimentos", account_type=AccountType.INVESTMENT, balance=50000.00, color="#8B5CF6", icon="chart-line"),
+        Account(name="Conta Principal", account_type=AccountType.CHECKING, balance=0.00, color="#3B82F6", icon="building-columns"),
     ]
     
     for acc in accounts:
@@ -449,72 +455,7 @@ async def seed_data():
         doc['created_at'] = doc['created_at'].isoformat()
         await db.accounts.insert_one(doc)
     
-    # Create categories
-    expense_categories = [
-        Category(name="Alimentação", type=TransactionType.EXPENSE, color="#F59E0B", icon="utensils"),
-        Category(name="Transporte", type=TransactionType.EXPENSE, color="#3B82F6", icon="car"),
-        Category(name="Moradia", type=TransactionType.EXPENSE, color="#8B5CF6", icon="home"),
-        Category(name="Saúde", type=TransactionType.EXPENSE, color="#EF4444", icon="heart-pulse"),
-        Category(name="Lazer", type=TransactionType.EXPENSE, color="#EC4899", icon="gamepad-2"),
-        Category(name="Educação", type=TransactionType.EXPENSE, color="#06B6D4", icon="graduation-cap"),
-        Category(name="Compras", type=TransactionType.EXPENSE, color="#F97316", icon="shopping-bag"),
-    ]
-    
-    income_categories = [
-        Category(name="Salário", type=TransactionType.INCOME, color="#10B981", icon="briefcase"),
-        Category(name="Freelance", type=TransactionType.INCOME, color="#22C55E", icon="laptop"),
-        Category(name="Investimentos", type=TransactionType.INCOME, color="#14B8A6", icon="trending-up"),
-        Category(name="Outros", type=TransactionType.INCOME, color="#6B7280", icon="plus-circle"),
-    ]
-    
-    all_categories = expense_categories + income_categories
-    for cat in all_categories:
-        doc = cat.model_dump()
-        await db.categories.insert_one(doc)
-    
-    # Create sample transactions
-    now = datetime.now(timezone.utc)
-    transactions_data = [
-        # Current month income
-        {"description": "Salário Agosto", "amount": 8500.00, "type": TransactionType.INCOME, "category": income_categories[0], "account": accounts[0], "days_ago": 5},
-        {"description": "Projeto Freelance", "amount": 2000.00, "type": TransactionType.INCOME, "category": income_categories[1], "account": accounts[0], "days_ago": 10},
-        {"description": "Dividendos", "amount": 350.00, "type": TransactionType.INCOME, "category": income_categories[2], "account": accounts[3], "days_ago": 15},
-        
-        # Current month expenses
-        {"description": "Supermercado", "amount": 450.00, "type": TransactionType.EXPENSE, "category": expense_categories[0], "account": accounts[0], "days_ago": 2},
-        {"description": "Restaurante", "amount": 120.00, "type": TransactionType.EXPENSE, "category": expense_categories[0], "account": accounts[2], "days_ago": 3},
-        {"description": "Combustível", "amount": 250.00, "type": TransactionType.EXPENSE, "category": expense_categories[1], "account": accounts[0], "days_ago": 4},
-        {"description": "Aluguel", "amount": 1800.00, "type": TransactionType.EXPENSE, "category": expense_categories[2], "account": accounts[0], "days_ago": 1},
-        {"description": "Plano de Saúde", "amount": 400.00, "type": TransactionType.EXPENSE, "category": expense_categories[3], "account": accounts[0], "days_ago": 5},
-        {"description": "Cinema", "amount": 80.00, "type": TransactionType.EXPENSE, "category": expense_categories[4], "account": accounts[2], "days_ago": 7},
-        {"description": "Curso Online", "amount": 150.00, "type": TransactionType.EXPENSE, "category": expense_categories[5], "account": accounts[2], "days_ago": 12},
-        {"description": "Roupas", "amount": 300.00, "type": TransactionType.EXPENSE, "category": expense_categories[6], "account": accounts[2], "days_ago": 8},
-        
-        # Previous months
-        {"description": "Salário Julho", "amount": 8500.00, "type": TransactionType.INCOME, "category": income_categories[0], "account": accounts[0], "days_ago": 35},
-        {"description": "Supermercado", "amount": 520.00, "type": TransactionType.EXPENSE, "category": expense_categories[0], "account": accounts[0], "days_ago": 32},
-        {"description": "Aluguel", "amount": 1800.00, "type": TransactionType.EXPENSE, "category": expense_categories[2], "account": accounts[0], "days_ago": 31},
-        {"description": "Salário Junho", "amount": 8500.00, "type": TransactionType.INCOME, "category": income_categories[0], "account": accounts[0], "days_ago": 65},
-        {"description": "Viagem", "amount": 2500.00, "type": TransactionType.EXPENSE, "category": expense_categories[4], "account": accounts[2], "days_ago": 60},
-    ]
-    
-    for tx_data in transactions_data:
-        tx = Transaction(
-            description=tx_data["description"],
-            amount=tx_data["amount"],
-            type=tx_data["type"],
-            category_id=tx_data["category"].id,
-            category_name=tx_data["category"].name,
-            account_id=tx_data["account"].id,
-            account_name=tx_data["account"].name,
-            date=now - timedelta(days=tx_data["days_ago"])
-        )
-        doc = tx.model_dump()
-        doc['date'] = doc['date'].isoformat()
-        doc['created_at'] = doc['created_at'].isoformat()
-        await db.transactions.insert_one(doc)
-    
-    return {"message": "Data seeded successfully", "accounts": len(accounts), "categories": len(all_categories), "transactions": len(transactions_data)}
+    return {"message": "Sistema inicializado com sucesso", "accounts": len(accounts), "categories": 0, "transactions": 0}
 
 # Include the router in the main app
 app.include_router(api_router)
