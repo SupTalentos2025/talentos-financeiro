@@ -845,12 +845,12 @@ function App() {
         <div className="absolute bottom-0 left-0 right-0 p-4 border-t">
           <Button
             variant="outline"
-            className="w-full"
-            onClick={seedData}
-            data-testid="seed-data-btn"
+            className="w-full text-destructive hover:text-destructive"
+            onClick={clearData}
+            data-testid="clear-data-btn"
           >
-            <RefreshCw className="h-4 w-4 mr-2" />
-            Carregar Dados Demo
+            <Trash2 className="h-4 w-4 mr-2" />
+            Limpar Todos os Dados
           </Button>
         </div>
       </aside>
