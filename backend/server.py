@@ -790,10 +790,22 @@ async def seed_data(current_user: User = Depends(get_current_user)):
 # Include the router in the main app
 app.include_router(api_router)
 
+# CORS configuration - must specify origins when using credentials
+cors_origins = [
+    "http://localhost:3000",
+    "https://localhost:3000",
+    "https://finance-hub-488.preview.emergentagent.com",
+]
+
+# Add any additional origins from environment
+env_origins = os.environ.get('CORS_ORIGINS', '')
+if env_origins:
+    cors_origins.extend([o.strip() for o in env_origins.split(',') if o.strip() and o.strip() != '*'])
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
