@@ -767,6 +767,256 @@ async def delete_bill(
         raise HTTPException(status_code=404, detail="Conta não encontrada")
     return {"message": "Conta excluída com sucesso"}
 
+# ============ NOTIFICATIONS ENDPOINTS ============
+class Notification(BaseModel):
+    id: str
+    type: str  # 'bill_due', 'bill_overdue', 'bill_paid', 'profit_summary', 'sales_summary'
+    title: str
+    message: str
+    company_id: str
+    company_name: str
+    data: dict = {}
+    read: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class NotificationResponse(BaseModel):
+    notifications: List[dict]
+    unread_count: int
+
+@api_router.get("/notifications")
+async def get_notifications(
+    current_user: User = Depends(get_current_user)
+):
+    """Get all notifications for the user across all companies"""
+    now = datetime.now(timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    # Get all user companies
+    companies = await db.companies.find({"owner_id": current_user.user_id}, {"_id": 0}).to_list(100)
+    
+    notifications = []
+    
+    for company in companies:
+        company_id = company["id"]
+        company_name = company["name"]
+        
+        # Get bills for this company
+        bills = await db.bills.find({"company_id": company_id}, {"_id": 0}).to_list(1000)
+        
+        # Get sales for this company (this month)
+        sales = await db.sales.find({"company_id": company_id}, {"_id": 0}).to_list(10000)
+        
+        # Calculate stats
+        bills_to_pay = []
+        bills_overdue = []
+        bills_paid_today = []
+        total_profit_month = 0
+        sales_today_count = 0
+        sales_today_total = 0
+        
+        for bill in bills:
+            due_date = bill.get('due_date', '')
+            if isinstance(due_date, str):
+                due_date = datetime.fromisoformat(due_date)
+            if due_date.tzinfo is None:
+                due_date = due_date.replace(tzinfo=timezone.utc)
+            
+            if bill['status'] == 'pending':
+                days_until_due = (due_date - now).days
+                
+                if days_until_due < 0:
+                    # Overdue
+                    bills_overdue.append({
+                        'description': bill['description'],
+                        'amount': bill['amount'],
+                        'days_overdue': abs(days_until_due)
+                    })
+                elif days_until_due <= 3:
+                    # Due soon (within 3 days)
+                    bills_to_pay.append({
+                        'description': bill['description'],
+                        'amount': bill['amount'],
+                        'days_until_due': days_until_due
+                    })
+            elif bill['status'] == 'paid':
+                paid_date = bill.get('paid_date', '')
+                if isinstance(paid_date, str) and paid_date:
+                    paid_date = datetime.fromisoformat(paid_date)
+                    if paid_date.tzinfo is None:
+                        paid_date = paid_date.replace(tzinfo=timezone.utc)
+                    if paid_date >= today:
+                        bills_paid_today.append({
+                            'description': bill['description'],
+                            'amount': bill['amount']
+                        })
+        
+        for sale in sales:
+            sale_date = sale.get('date', '')
+            if isinstance(sale_date, str):
+                sale_date = datetime.fromisoformat(sale_date)
+            if sale_date.tzinfo is None:
+                sale_date = sale_date.replace(tzinfo=timezone.utc)
+            
+            if sale_date >= start_of_month:
+                total_profit_month += sale.get('profit', 0)
+            
+            if sale_date >= today:
+                sales_today_count += 1
+                sales_today_total += sale.get('total', 0)
+        
+        # Generate notifications
+        
+        # Overdue bills (high priority)
+        for bill in bills_overdue:
+            notifications.append({
+                'id': f"overdue_{company_id}_{bill['description'][:10]}",
+                'type': 'bill_overdue',
+                'priority': 'high',
+                'title': '⚠️ Conta Vencida!',
+                'message': f"{bill['description']} está vencida há {bill['days_overdue']} dia(s) - R$ {bill['amount']:.2f}",
+                'company_id': company_id,
+                'company_name': company_name,
+                'data': bill,
+                'created_at': now.isoformat()
+            })
+        
+        # Bills due soon (medium priority)
+        for bill in bills_to_pay:
+            if bill['days_until_due'] == 0:
+                msg = f"{bill['description']} vence HOJE - R$ {bill['amount']:.2f}"
+                title = '🔴 Conta Vence Hoje!'
+            elif bill['days_until_due'] == 1:
+                msg = f"{bill['description']} vence AMANHÃ - R$ {bill['amount']:.2f}"
+                title = '🟠 Conta Vence Amanhã'
+            else:
+                msg = f"{bill['description']} vence em {bill['days_until_due']} dias - R$ {bill['amount']:.2f}"
+                title = '🟡 Conta a Vencer'
+            
+            notifications.append({
+                'id': f"due_{company_id}_{bill['description'][:10]}",
+                'type': 'bill_due',
+                'priority': 'medium' if bill['days_until_due'] > 0 else 'high',
+                'title': title,
+                'message': msg,
+                'company_id': company_id,
+                'company_name': company_name,
+                'data': bill,
+                'created_at': now.isoformat()
+            })
+        
+        # Bills paid today (low priority - positive)
+        if bills_paid_today:
+            total_paid = sum(b['amount'] for b in bills_paid_today)
+            notifications.append({
+                'id': f"paid_{company_id}_{today.isoformat()}",
+                'type': 'bill_paid',
+                'priority': 'low',
+                'title': '✅ Contas Pagas Hoje',
+                'message': f"{len(bills_paid_today)} conta(s) paga(s) - Total: R$ {total_paid:.2f}",
+                'company_id': company_id,
+                'company_name': company_name,
+                'data': {'bills': bills_paid_today, 'total': total_paid},
+                'created_at': now.isoformat()
+            })
+        
+        # Monthly profit summary
+        if total_profit_month != 0:
+            if total_profit_month > 0:
+                notifications.append({
+                    'id': f"profit_{company_id}_{start_of_month.isoformat()}",
+                    'type': 'profit_summary',
+                    'priority': 'info',
+                    'title': '💰 Lucro do Mês',
+                    'message': f"Lucro acumulado: R$ {total_profit_month:.2f}",
+                    'company_id': company_id,
+                    'company_name': company_name,
+                    'data': {'profit': total_profit_month},
+                    'created_at': now.isoformat()
+                })
+            else:
+                notifications.append({
+                    'id': f"profit_{company_id}_{start_of_month.isoformat()}",
+                    'type': 'profit_summary',
+                    'priority': 'medium',
+                    'title': '📉 Atenção: Prejuízo',
+                    'message': f"Prejuízo acumulado: R$ {abs(total_profit_month):.2f}",
+                    'company_id': company_id,
+                    'company_name': company_name,
+                    'data': {'profit': total_profit_month},
+                    'created_at': now.isoformat()
+                })
+        
+        # Sales today summary
+        if sales_today_count > 0:
+            notifications.append({
+                'id': f"sales_{company_id}_{today.isoformat()}",
+                'type': 'sales_summary',
+                'priority': 'info',
+                'title': '🛒 Vendas de Hoje',
+                'message': f"{sales_today_count} venda(s) - Total: R$ {sales_today_total:.2f}",
+                'company_id': company_id,
+                'company_name': company_name,
+                'data': {'count': sales_today_count, 'total': sales_today_total},
+                'created_at': now.isoformat()
+            })
+    
+    # Sort by priority
+    priority_order = {'high': 0, 'medium': 1, 'low': 2, 'info': 3}
+    notifications.sort(key=lambda x: priority_order.get(x.get('priority', 'info'), 4))
+    
+    # Count high priority (unread equivalent)
+    unread_count = len([n for n in notifications if n.get('priority') in ['high', 'medium']])
+    
+    return {
+        'notifications': notifications,
+        'unread_count': unread_count
+    }
+
+@api_router.get("/notifications/summary")
+async def get_notifications_summary(
+    current_user: User = Depends(get_current_user)
+):
+    """Get a quick summary of important notifications"""
+    now = datetime.now(timezone.utc)
+    
+    companies = await db.companies.find({"owner_id": current_user.user_id}, {"_id": 0}).to_list(100)
+    
+    total_overdue = 0
+    total_due_soon = 0
+    total_overdue_amount = 0
+    total_due_soon_amount = 0
+    
+    for company in companies:
+        bills = await db.bills.find({
+            "company_id": company["id"],
+            "status": "pending"
+        }, {"_id": 0}).to_list(1000)
+        
+        for bill in bills:
+            due_date = bill.get('due_date', '')
+            if isinstance(due_date, str):
+                due_date = datetime.fromisoformat(due_date)
+            if due_date.tzinfo is None:
+                due_date = due_date.replace(tzinfo=timezone.utc)
+            
+            days_until_due = (due_date - now).days
+            
+            if days_until_due < 0:
+                total_overdue += 1
+                total_overdue_amount += bill['amount']
+            elif days_until_due <= 3:
+                total_due_soon += 1
+                total_due_soon_amount += bill['amount']
+    
+    return {
+        'overdue_count': total_overdue,
+        'overdue_amount': total_overdue_amount,
+        'due_soon_count': total_due_soon,
+        'due_soon_amount': total_due_soon_amount,
+        'total_alerts': total_overdue + total_due_soon
+    }
+
 # ============ DASHBOARD ENDPOINTS ============
 @api_router.get("/dashboard/stats", response_model=DashboardStats)
 async def get_dashboard_stats(
