@@ -1,12 +1,13 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, Response, Request, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Query, Response, Request, Depends, Header
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import re
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
 from typing import List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -34,6 +35,23 @@ app = FastAPI(title="Sistema de Gestão de Vendas")
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# ============ HELPER FUNCTIONS ============
+def validate_cnpj(cnpj: str) -> str:
+    """Validate and format CNPJ"""
+    # Remove non-digits
+    cnpj = re.sub(r'\D', '', cnpj)
+    if len(cnpj) != 14:
+        raise ValueError("CNPJ deve ter 14 dígitos")
+    # Format as XX.XXX.XXX/XXXX-XX
+    return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+
+def format_cnpj_display(cnpj: str) -> str:
+    """Format CNPJ for display"""
+    cnpj_digits = re.sub(r'\D', '', cnpj)
+    if len(cnpj_digits) == 14:
+        return f"{cnpj_digits[:2]}.{cnpj_digits[2:5]}.{cnpj_digits[5:8]}/{cnpj_digits[8:12]}-{cnpj_digits[12:]}"
+    return cnpj
+
 # ============ AUTH MODELS ============
 class UserCreate(BaseModel):
     email: EmailStr
@@ -50,7 +68,7 @@ class User(BaseModel):
     email: str
     name: str
     picture: Optional[str] = None
-    auth_provider: str = "email"  # "email" or "google"
+    auth_provider: str = "email"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class UserResponse(BaseModel):
@@ -58,6 +76,33 @@ class UserResponse(BaseModel):
     email: str
     name: str
     picture: Optional[str] = None
+
+# ============ COMPANY MODELS ============
+class Company(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    cnpj: str
+    owner_id: str  # User who created the company
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class CompanyCreate(BaseModel):
+    name: str
+    cnpj: str
+    
+    @field_validator('cnpj')
+    @classmethod
+    def validate_cnpj_field(cls, v):
+        cnpj = re.sub(r'\D', '', v)
+        if len(cnpj) != 14:
+            raise ValueError('CNPJ deve ter 14 dígitos')
+        return cnpj
+
+class CompanyResponse(BaseModel):
+    id: str
+    name: str
+    cnpj: str
+    owner_id: str
 
 # ============ BUSINESS MODELS ============
 class BillStatus(str, Enum):
@@ -71,7 +116,7 @@ class Product(BaseModel):
     price: float
     cost: float = 0.0
     stock: int = 0
-    user_id: str = ""
+    company_id: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class ProductCreate(BaseModel):
@@ -89,7 +134,7 @@ class Sale(BaseModel):
     unit_price: float
     total: float
     profit: float = 0.0
-    user_id: str = ""
+    company_id: str = ""
     date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -106,7 +151,7 @@ class Bill(BaseModel):
     status: BillStatus = BillStatus.PENDING
     due_date: datetime
     paid_date: Optional[datetime] = None
-    user_id: str = ""
+    company_id: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class BillCreate(BaseModel):
@@ -168,10 +213,8 @@ def decode_jwt_token(token: str) -> Optional[dict]:
 
 async def get_current_user(request: Request) -> User:
     """Get current user from session_token cookie or Authorization header"""
-    # Try cookie first
     session_token = request.cookies.get("session_token")
     
-    # Fallback to Authorization header
     if not session_token:
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
@@ -180,12 +223,10 @@ async def get_current_user(request: Request) -> User:
     if not session_token:
         raise HTTPException(status_code=401, detail="Não autenticado")
     
-    # Check session in database
     session = await db.user_sessions.find_one({"session_token": session_token}, {"_id": 0})
     if not session:
         raise HTTPException(status_code=401, detail="Sessão inválida")
     
-    # Check expiry
     expires_at = session.get("expires_at")
     if isinstance(expires_at, str):
         expires_at = datetime.fromisoformat(expires_at)
@@ -194,7 +235,6 @@ async def get_current_user(request: Request) -> User:
     if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Sessão expirada")
     
-    # Get user
     user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
@@ -203,6 +243,30 @@ async def get_current_user(request: Request) -> User:
         user['created_at'] = datetime.fromisoformat(user['created_at'])
     
     return User(**user)
+
+async def get_current_company(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    x_company_id: Optional[str] = Header(None)
+) -> Company:
+    """Get current company from header"""
+    company_id = x_company_id
+    
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Empresa não selecionada. Selecione uma empresa.")
+    
+    company = await db.companies.find_one({
+        "id": company_id,
+        "owner_id": current_user.user_id
+    }, {"_id": 0})
+    
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+    
+    if isinstance(company.get('created_at'), str):
+        company['created_at'] = datetime.fromisoformat(company['created_at'])
+    
+    return Company(**company)
 
 # Helper functions
 def get_start_of_day():
@@ -221,18 +285,16 @@ def get_start_of_week():
 # Root endpoint
 @api_router.get("/")
 async def root():
-    return {"message": "Sistema de Gestão de Vendas API", "version": "1.0.0"}
+    return {"message": "Sistema de Gestão de Vendas API", "version": "2.0.0"}
 
 # ============ AUTH ENDPOINTS ============
 @api_router.post("/auth/register")
 async def register(input: UserCreate, response: Response):
     """Register new user with email and password"""
-    # Check if user exists
     existing = await db.users.find_one({"email": input.email}, {"_id": 0})
     if existing:
         raise HTTPException(status_code=400, detail="Email já cadastrado")
     
-    # Create user
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     hashed_password = hash_password(input.password)
     
@@ -248,7 +310,6 @@ async def register(input: UserCreate, response: Response):
     
     await db.users.insert_one(user_doc)
     
-    # Create session
     session_token = f"session_{uuid.uuid4().hex}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRATION_DAYS)
     
@@ -259,7 +320,6 @@ async def register(input: UserCreate, response: Response):
         "created_at": datetime.now(timezone.utc).isoformat()
     })
     
-    # Set cookie
     response.set_cookie(
         key="session_token",
         value=session_token,
@@ -290,7 +350,6 @@ async def login(input: UserLogin, response: Response):
     if not verify_password(input.password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Email ou senha incorretos")
     
-    # Create session
     session_token = f"session_{uuid.uuid4().hex}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRATION_DAYS)
     
@@ -301,7 +360,6 @@ async def login(input: UserLogin, response: Response):
         "created_at": datetime.now(timezone.utc).isoformat()
     })
     
-    # Set cookie
     response.set_cookie(
         key="session_token",
         value=session_token,
@@ -328,7 +386,6 @@ async def google_session(request: Request, response: Response):
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id é obrigatório")
     
-    # Call Emergent Auth API
     async with httpx.AsyncClient() as client:
         try:
             auth_response = await client.get(
@@ -348,18 +405,15 @@ async def google_session(request: Request, response: Response):
     name = google_data.get("name")
     picture = google_data.get("picture")
     
-    # Check if user exists
     existing_user = await db.users.find_one({"email": email}, {"_id": 0})
     
     if existing_user:
         user_id = existing_user["user_id"]
-        # Update user info if needed
         await db.users.update_one(
             {"user_id": user_id},
             {"$set": {"name": name, "picture": picture}}
         )
     else:
-        # Create new user
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         user_doc = {
             "user_id": user_id,
@@ -371,7 +425,6 @@ async def google_session(request: Request, response: Response):
         }
         await db.users.insert_one(user_doc)
     
-    # Create session
     session_token = f"session_{uuid.uuid4().hex}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRATION_DAYS)
     
@@ -382,7 +435,6 @@ async def google_session(request: Request, response: Response):
         "created_at": datetime.now(timezone.utc).isoformat()
     })
     
-    # Set cookie
     response.set_cookie(
         key="session_token",
         value=session_token,
@@ -427,34 +479,158 @@ async def logout(request: Request, response: Response):
     
     return {"message": "Logout realizado com sucesso"}
 
+# ============ COMPANY ENDPOINTS ============
+@api_router.post("/companies", response_model=CompanyResponse)
+async def create_company(input: CompanyCreate, current_user: User = Depends(get_current_user)):
+    """Create a new company"""
+    # Check if CNPJ already exists for this user
+    cnpj_digits = re.sub(r'\D', '', input.cnpj)
+    existing = await db.companies.find_one({
+        "owner_id": current_user.user_id,
+        "cnpj": {"$regex": cnpj_digits}
+    }, {"_id": 0})
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="Você já possui uma empresa com este CNPJ")
+    
+    company = Company(
+        name=input.name,
+        cnpj=format_cnpj_display(input.cnpj),
+        owner_id=current_user.user_id
+    )
+    
+    doc = company.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    await db.companies.insert_one(doc)
+    
+    return CompanyResponse(
+        id=company.id,
+        name=company.name,
+        cnpj=company.cnpj,
+        owner_id=company.owner_id
+    )
+
+@api_router.get("/companies", response_model=List[CompanyResponse])
+async def get_companies(current_user: User = Depends(get_current_user)):
+    """Get all companies for current user"""
+    companies = await db.companies.find(
+        {"owner_id": current_user.user_id},
+        {"_id": 0}
+    ).sort("name", 1).to_list(100)
+    
+    return [CompanyResponse(
+        id=c["id"],
+        name=c["name"],
+        cnpj=c["cnpj"],
+        owner_id=c["owner_id"]
+    ) for c in companies]
+
+@api_router.get("/companies/{company_id}", response_model=CompanyResponse)
+async def get_company(company_id: str, current_user: User = Depends(get_current_user)):
+    """Get a specific company"""
+    company = await db.companies.find_one({
+        "id": company_id,
+        "owner_id": current_user.user_id
+    }, {"_id": 0})
+    
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+    
+    return CompanyResponse(
+        id=company["id"],
+        name=company["name"],
+        cnpj=company["cnpj"],
+        owner_id=company["owner_id"]
+    )
+
+@api_router.put("/companies/{company_id}", response_model=CompanyResponse)
+async def update_company(company_id: str, input: CompanyCreate, current_user: User = Depends(get_current_user)):
+    """Update a company"""
+    company = await db.companies.find_one({
+        "id": company_id,
+        "owner_id": current_user.user_id
+    }, {"_id": 0})
+    
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+    
+    await db.companies.update_one(
+        {"id": company_id},
+        {"$set": {
+            "name": input.name,
+            "cnpj": format_cnpj_display(input.cnpj)
+        }}
+    )
+    
+    return CompanyResponse(
+        id=company_id,
+        name=input.name,
+        cnpj=format_cnpj_display(input.cnpj),
+        owner_id=current_user.user_id
+    )
+
+@api_router.delete("/companies/{company_id}")
+async def delete_company(company_id: str, current_user: User = Depends(get_current_user)):
+    """Delete a company and all its data"""
+    company = await db.companies.find_one({
+        "id": company_id,
+        "owner_id": current_user.user_id
+    }, {"_id": 0})
+    
+    if not company:
+        raise HTTPException(status_code=404, detail="Empresa não encontrada")
+    
+    # Delete all company data
+    await db.products.delete_many({"company_id": company_id})
+    await db.sales.delete_many({"company_id": company_id})
+    await db.bills.delete_many({"company_id": company_id})
+    await db.companies.delete_one({"id": company_id})
+    
+    return {"message": "Empresa excluída com sucesso"}
+
 # ============ PRODUCTS ENDPOINTS ============
 @api_router.post("/products", response_model=Product)
-async def create_product(input: ProductCreate, current_user: User = Depends(get_current_user)):
-    product = Product(**input.model_dump(), user_id=current_user.user_id)
+async def create_product(
+    input: ProductCreate,
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    product = Product(**input.model_dump(), company_id=company.id)
     doc = product.model_dump()
     doc['created_at'] = doc['created_at'].isoformat()
     await db.products.insert_one(doc)
     return product
 
 @api_router.get("/products", response_model=List[Product])
-async def get_products(current_user: User = Depends(get_current_user)):
-    products = await db.products.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(500)
+async def get_products(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    products = await db.products.find({"company_id": company.id}, {"_id": 0}).to_list(500)
     for p in products:
         if isinstance(p.get('created_at'), str):
             p['created_at'] = datetime.fromisoformat(p['created_at'])
     return products
 
 @api_router.delete("/products/{product_id}")
-async def delete_product(product_id: str, current_user: User = Depends(get_current_user)):
-    result = await db.products.delete_one({"id": product_id, "user_id": current_user.user_id})
+async def delete_product(
+    product_id: str,
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    result = await db.products.delete_one({"id": product_id, "company_id": company.id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
     return {"message": "Produto excluído com sucesso"}
 
 # ============ SALES ENDPOINTS ============
 @api_router.post("/sales", response_model=Sale)
-async def create_sale(input: SaleCreate, current_user: User = Depends(get_current_user)):
-    product = await db.products.find_one({"id": input.product_id, "user_id": current_user.user_id}, {"_id": 0})
+async def create_sale(
+    input: SaleCreate,
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    product = await db.products.find_one({"id": input.product_id, "company_id": company.id}, {"_id": 0})
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
     
@@ -471,7 +647,7 @@ async def create_sale(input: SaleCreate, current_user: User = Depends(get_curren
         unit_price=product['price'],
         total=total,
         profit=profit,
-        user_id=current_user.user_id,
+        company_id=company.id,
         date=input.date or datetime.now(timezone.utc)
     )
     
@@ -491,11 +667,12 @@ async def create_sale(input: SaleCreate, current_user: User = Depends(get_curren
 @api_router.get("/sales", response_model=List[Sale])
 async def get_sales(
     current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company),
     limit: int = Query(100, ge=1, le=1000),
     skip: int = Query(0, ge=0)
 ):
     sales = await db.sales.find(
-        {"user_id": current_user.user_id}, {"_id": 0}
+        {"company_id": company.id}, {"_id": 0}
     ).sort("date", -1).skip(skip).limit(limit).to_list(limit)
     
     for s in sales:
@@ -507,8 +684,12 @@ async def get_sales(
     return sales
 
 @api_router.delete("/sales/{sale_id}")
-async def delete_sale(sale_id: str, current_user: User = Depends(get_current_user)):
-    sale = await db.sales.find_one({"id": sale_id, "user_id": current_user.user_id}, {"_id": 0})
+async def delete_sale(
+    sale_id: str,
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    sale = await db.sales.find_one({"id": sale_id, "company_id": company.id}, {"_id": 0})
     if not sale:
         raise HTTPException(status_code=404, detail="Venda não encontrada")
     
@@ -522,8 +703,12 @@ async def delete_sale(sale_id: str, current_user: User = Depends(get_current_use
 
 # ============ BILLS ENDPOINTS ============
 @api_router.post("/bills", response_model=Bill)
-async def create_bill(input: BillCreate, current_user: User = Depends(get_current_user)):
-    bill = Bill(**input.model_dump(), user_id=current_user.user_id)
+async def create_bill(
+    input: BillCreate,
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    bill = Bill(**input.model_dump(), company_id=company.id)
     doc = bill.model_dump()
     doc['due_date'] = doc['due_date'].isoformat()
     doc['created_at'] = doc['created_at'].isoformat()
@@ -533,8 +718,12 @@ async def create_bill(input: BillCreate, current_user: User = Depends(get_curren
     return bill
 
 @api_router.get("/bills", response_model=List[Bill])
-async def get_bills(current_user: User = Depends(get_current_user), status: Optional[BillStatus] = None):
-    query = {"user_id": current_user.user_id}
+async def get_bills(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company),
+    status: Optional[BillStatus] = None
+):
+    query = {"company_id": company.id}
     if status:
         query["status"] = status.value
     
@@ -551,9 +740,13 @@ async def get_bills(current_user: User = Depends(get_current_user), status: Opti
     return bills
 
 @api_router.put("/bills/{bill_id}/pay")
-async def pay_bill(bill_id: str, current_user: User = Depends(get_current_user)):
+async def pay_bill(
+    bill_id: str,
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
     result = await db.bills.update_one(
-        {"id": bill_id, "user_id": current_user.user_id},
+        {"id": bill_id, "company_id": company.id},
         {"$set": {
             "status": BillStatus.PAID.value,
             "paid_date": datetime.now(timezone.utc).isoformat()
@@ -564,19 +757,26 @@ async def pay_bill(bill_id: str, current_user: User = Depends(get_current_user))
     return {"message": "Conta marcada como paga"}
 
 @api_router.delete("/bills/{bill_id}")
-async def delete_bill(bill_id: str, current_user: User = Depends(get_current_user)):
-    result = await db.bills.delete_one({"id": bill_id, "user_id": current_user.user_id})
+async def delete_bill(
+    bill_id: str,
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    result = await db.bills.delete_one({"id": bill_id, "company_id": company.id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Conta não encontrada")
     return {"message": "Conta excluída com sucesso"}
 
 # ============ DASHBOARD ENDPOINTS ============
 @api_router.get("/dashboard/stats", response_model=DashboardStats)
-async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
+async def get_dashboard_stats(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
     start_of_day = get_start_of_day().isoformat()
     start_of_month = get_start_of_month().isoformat()
     
-    sales = await db.sales.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(10000)
+    sales = await db.sales.find({"company_id": company.id}, {"_id": 0}).to_list(10000)
     
     sales_today = 0
     sales_today_count = 0
@@ -594,7 +794,7 @@ async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
             sales_month_count += 1
             profit_month += sale.get('profit', 0)
     
-    bills = await db.bills.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(10000)
+    bills = await db.bills.find({"company_id": company.id}, {"_id": 0}).to_list(10000)
     
     bills_to_pay = sum(b['amount'] for b in bills if b['status'] == BillStatus.PENDING.value)
     bills_paid_month = 0
@@ -618,11 +818,14 @@ async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
     )
 
 @api_router.get("/dashboard/top-products-week", response_model=List[TopProduct])
-async def get_top_products_week(current_user: User = Depends(get_current_user)):
+async def get_top_products_week(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
     start_of_week = get_start_of_week().isoformat()
     
     sales = await db.sales.find(
-        {"user_id": current_user.user_id, "date": {"$gte": start_of_week}},
+        {"company_id": company.id, "date": {"$gte": start_of_week}},
         {"_id": 0}
     ).to_list(10000)
     
@@ -643,11 +846,14 @@ async def get_top_products_week(current_user: User = Depends(get_current_user)):
     return [TopProduct(**p) for p in sorted_products[:10]]
 
 @api_router.get("/dashboard/top-products-month", response_model=List[TopProduct])
-async def get_top_products_month(current_user: User = Depends(get_current_user)):
+async def get_top_products_month(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
     start_of_month = get_start_of_month().isoformat()
     
     sales = await db.sales.find(
-        {"user_id": current_user.user_id, "date": {"$gte": start_of_month}},
+        {"company_id": company.id, "date": {"$gte": start_of_month}},
         {"_id": 0}
     ).to_list(10000)
     
@@ -668,11 +874,15 @@ async def get_top_products_month(current_user: User = Depends(get_current_user))
     return [TopProduct(**p) for p in sorted_products[:10]]
 
 @api_router.get("/dashboard/daily-sales", response_model=List[DailySales])
-async def get_daily_sales(current_user: User = Depends(get_current_user), days: int = Query(7, ge=1, le=30)):
+async def get_daily_sales(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company),
+    days: int = Query(7, ge=1, le=30)
+):
     now = datetime.now(timezone.utc)
     result = []
     
-    sales = await db.sales.find({"user_id": current_user.user_id}, {"_id": 0}).to_list(10000)
+    sales = await db.sales.find({"company_id": company.id}, {"_id": 0}).to_list(10000)
     
     for i in range(days - 1, -1, -1):
         day = now - timedelta(days=i)
@@ -698,30 +908,34 @@ async def get_daily_sales(current_user: User = Depends(get_current_user), days: 
 
 # ============ DATA MANAGEMENT ENDPOINTS ============
 @api_router.post("/clear")
-async def clear_data(current_user: User = Depends(get_current_user)):
-    """Clear all user data"""
-    await db.products.delete_many({"user_id": current_user.user_id})
-    await db.sales.delete_many({"user_id": current_user.user_id})
-    await db.bills.delete_many({"user_id": current_user.user_id})
-    return {"message": "Todos os dados foram limpos"}
+async def clear_data(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    """Clear all data for the current company"""
+    await db.products.delete_many({"company_id": company.id})
+    await db.sales.delete_many({"company_id": company.id})
+    await db.bills.delete_many({"company_id": company.id})
+    return {"message": "Todos os dados da empresa foram limpos"}
 
 @api_router.post("/seed")
-async def seed_data(current_user: User = Depends(get_current_user)):
-    """Seed sample data for the current user"""
-    # Clear existing data
-    await db.products.delete_many({"user_id": current_user.user_id})
-    await db.sales.delete_many({"user_id": current_user.user_id})
-    await db.bills.delete_many({"user_id": current_user.user_id})
+async def seed_data(
+    current_user: User = Depends(get_current_user),
+    company: Company = Depends(get_current_company)
+):
+    """Seed sample data for the current company"""
+    await db.products.delete_many({"company_id": company.id})
+    await db.sales.delete_many({"company_id": company.id})
+    await db.bills.delete_many({"company_id": company.id})
     
     now = datetime.now(timezone.utc)
     
-    # Create products
     products = [
-        Product(name="Camiseta Básica", price=49.90, cost=20.00, stock=100, user_id=current_user.user_id),
-        Product(name="Calça Jeans", price=129.90, cost=50.00, stock=50, user_id=current_user.user_id),
-        Product(name="Tênis Esportivo", price=199.90, cost=80.00, stock=30, user_id=current_user.user_id),
-        Product(name="Boné", price=39.90, cost=15.00, stock=80, user_id=current_user.user_id),
-        Product(name="Meia Pack 3", price=29.90, cost=10.00, stock=200, user_id=current_user.user_id),
+        Product(name="Camiseta Básica", price=49.90, cost=20.00, stock=100, company_id=company.id),
+        Product(name="Calça Jeans", price=129.90, cost=50.00, stock=50, company_id=company.id),
+        Product(name="Tênis Esportivo", price=199.90, cost=80.00, stock=30, company_id=company.id),
+        Product(name="Boné", price=39.90, cost=15.00, stock=80, company_id=company.id),
+        Product(name="Meia Pack 3", price=29.90, cost=10.00, stock=200, company_id=company.id),
     ]
     
     for p in products:
@@ -729,7 +943,6 @@ async def seed_data(current_user: User = Depends(get_current_user)):
         doc['created_at'] = doc['created_at'].isoformat()
         await db.products.insert_one(doc)
     
-    # Create sample sales
     sales_data = [
         {"product": products[0], "qty": 5, "days_ago": 0},
         {"product": products[1], "qty": 2, "days_ago": 0},
@@ -749,7 +962,7 @@ async def seed_data(current_user: User = Depends(get_current_user)):
             unit_price=product.price,
             total=product.price * s_data['qty'],
             profit=(product.price - product.cost) * s_data['qty'],
-            user_id=current_user.user_id,
+            company_id=company.id,
             date=now - timedelta(days=s_data['days_ago'])
         )
         doc = sale.model_dump()
@@ -757,7 +970,6 @@ async def seed_data(current_user: User = Depends(get_current_user)):
         doc['created_at'] = doc['created_at'].isoformat()
         await db.sales.insert_one(doc)
     
-    # Create sample bills
     bills_data = [
         {"desc": "Aluguel Loja", "amount": 3500.00, "days_due": 5, "status": "pending"},
         {"desc": "Energia Elétrica", "amount": 450.00, "days_due": 10, "status": "pending"},
@@ -771,7 +983,7 @@ async def seed_data(current_user: User = Depends(get_current_user)):
             status=BillStatus.PAID if b_data['status'] == 'paid' else BillStatus.PENDING,
             due_date=now + timedelta(days=b_data['days_due']),
             paid_date=now + timedelta(days=b_data['days_due']) if b_data['status'] == 'paid' else None,
-            user_id=current_user.user_id
+            company_id=company.id
         )
         doc = bill.model_dump()
         doc['due_date'] = doc['due_date'].isoformat()
@@ -790,14 +1002,13 @@ async def seed_data(current_user: User = Depends(get_current_user)):
 # Include the router in the main app
 app.include_router(api_router)
 
-# CORS configuration - must specify origins when using credentials
+# CORS configuration
 cors_origins = [
     "http://localhost:3000",
     "https://localhost:3000",
     "https://finance-hub-488.preview.emergentagent.com",
 ]
 
-# Add any additional origins from environment
 env_origins = os.environ.get('CORS_ORIGINS', '')
 if env_origins:
     cors_origins.extend([o.strip() for o in env_origins.split(',') if o.strip() and o.strip() != '*'])
