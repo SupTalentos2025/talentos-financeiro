@@ -1,6 +1,7 @@
 {
   "name": "frontend",
   "version": "0.1.0",
+  "homepage": "https://suptalentos2025.github.io/talentos-financeiro",
   "private": true,
   "dependencies": {
     "@hookform/resolvers": "^5.0.1",
