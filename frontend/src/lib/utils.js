@@ -1,6 +1,11 @@
-import { clsx } from "clsx";
-import { twMerge } from "tailwind-merge"
-
-export function cn(...inputs) {
-  return twMerge(clsx(inputs));
-}
+fetch("https://finance-hub-488.preview.emergentagent.com/auth/login", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+  },
+  credentials: "include",
+  body: JSON.stringify({
+    email,
+    password,
+  }),
+});
