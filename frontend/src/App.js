@@ -80,8 +80,11 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+const BACKEND_URL =
+  process.env.REACT_APP_BACKEND_URL ||
+  "https://finance-hub-488.preview.emergentagent.com";
+
+const API = BACKEND_URL;
 
 // Configure axios
 axios.defaults.withCredentials = true;
