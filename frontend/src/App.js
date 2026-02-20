@@ -1978,6 +1978,19 @@ function Dashboard({ user, onLogout }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Mobile Bottom Navigation */}
+      {selectedCompany && (
+        <BottomNavigation 
+          activeTab={activeTab} 
+          onTabChange={(tab) => { setActiveTab(tab); setSidebarOpen(false); }}
+          unreadNotifications={notifications.filter(n => n.priority === 'high' || n.priority === 'medium').length}
+          onNewSale={() => setSaleDialogOpen(true)}
+        />
+      )}
+
+      {/* PWA Install Banner */}
+      {showInstallBanner && <InstallBanner onClose={() => setShowInstallBanner(false)} />}
     </div>
   );
 }
