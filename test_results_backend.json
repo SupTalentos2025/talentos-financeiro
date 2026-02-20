@@ -1,0 +1,8 @@
+{
+  "total": 26,
+  "passed": 25,
+  "failed": 1,
+  "errors": [
+    "Inventory Check: Should have failed with insufficient stock"
+  ]
+}
