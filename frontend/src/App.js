@@ -1174,6 +1174,10 @@ function Dashboard({ user, onLogout }) {
                   <Button variant="outline" size="sm" className="bg-transparent border-slate-700 text-slate-300 hover:bg-slate-800" onClick={fetchData} data-testid="refresh-btn">
                     <RefreshCw className="h-4 w-4" />
                   </Button>
+                  
+                  <Button variant="ghost" size="sm" className="text-slate-400 hover:text-white md:hidden" onClick={shareApp} data-testid="share-btn">
+                    <Share2 className="h-4 w-4" />
+                  </Button>
                 </>
               )}
             </div>
