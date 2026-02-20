@@ -679,6 +679,7 @@ function Dashboard({ user, onLogout }) {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
+  const [showInstallBanner, setShowInstallBanner] = useState(true);
 
   const [saleDialogOpen, setSaleDialogOpen] = useState(false);
   const [productDialogOpen, setProductDialogOpen] = useState(false);
