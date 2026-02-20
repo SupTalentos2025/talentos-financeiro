@@ -94,6 +94,223 @@ const API = `${BACKEND_URL}/api`;
 
 axios.defaults.withCredentials = true;
 
+// ============ PWA INSTALL BANNER ============
+function InstallBanner({ onClose }) {
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
+  const [showBanner, setShowBanner] = useState(false);
+
+  useEffect(() => {
+    const handler = (e) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      // Show banner if not installed and not dismissed recently
+      const dismissed = localStorage.getItem('pwa-banner-dismissed');
+      if (!dismissed || Date.now() - parseInt(dismissed) > 86400000) {
+        setShowBanner(true);
+      }
+    };
+
+    window.addEventListener('beforeinstallprompt', handler);
+    
+    // Check if running as PWA
+    if (window.matchMedia('(display-mode: standalone)').matches) {
+      setShowBanner(false);
+    }
+
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  const handleInstall = async () => {
+    if (!deferredPrompt) return;
+    
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    
+    if (outcome === 'accepted') {
+      setShowBanner(false);
+    }
+    setDeferredPrompt(null);
+  };
+
+  const handleDismiss = () => {
+    setShowBanner(false);
+    localStorage.setItem('pwa-banner-dismissed', Date.now().toString());
+    if (onClose) onClose();
+  };
+
+  if (!showBanner) return null;
+
+  return (
+    <div className="fixed bottom-20 left-4 right-4 md:bottom-4 md:left-auto md:right-4 md:w-80 bg-slate-900 border border-emerald-500/30 rounded-2xl p-4 shadow-2xl z-50 animate-slide-up" data-testid="install-banner">
+      <div className="flex items-start gap-3">
+        <div className="p-2 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex-shrink-0">
+          <Smartphone className="h-6 w-6 text-white" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <h3 className="font-semibold text-white text-sm">Instalar Talentos</h3>
+          <p className="text-xs text-slate-400 mt-1">Adicione à tela inicial para acesso rápido</p>
+        </div>
+        <button onClick={handleDismiss} className="text-slate-500 hover:text-white p-1">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="flex gap-2 mt-3">
+        <Button 
+          size="sm" 
+          variant="outline" 
+          className="flex-1 bg-transparent border-slate-700 text-slate-300 hover:bg-slate-800 h-9"
+          onClick={handleDismiss}
+        >
+          Agora não
+        </Button>
+        <Button 
+          size="sm" 
+          className="flex-1 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 h-9"
+          onClick={handleInstall}
+          data-testid="install-app-btn"
+        >
+          Instalar
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// ============ BOTTOM NAVIGATION (MOBILE) ============
+function BottomNavigation({ activeTab, onTabChange, unreadNotifications, onNewSale }) {
+  const navItems = [
+    { id: 'dashboard', icon: Home, label: 'Início' },
+    { id: 'sales', icon: ShoppingCart, label: 'Vendas' },
+    { id: 'new-sale', icon: Plus, label: 'Vender', isAction: true },
+    { id: 'products', icon: Package, label: 'Produtos' },
+    { id: 'bills', icon: CreditCard, label: 'Contas' },
+  ];
+
+  return (
+    <nav className="fixed bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur-lg border-t border-slate-800 safe-bottom md:hidden z-40" data-testid="bottom-nav">
+      <div className="flex items-center justify-around h-16 px-2">
+        {navItems.map((item) => {
+          if (item.isAction) {
+            return (
+              <button
+                key={item.id}
+                onClick={onNewSale}
+                className="flex flex-col items-center justify-center -mt-6"
+                data-testid="quick-sale-btn"
+              >
+                <div className="w-14 h-14 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/30">
+                  <item.icon className="h-7 w-7 text-white" />
+                </div>
+              </button>
+            );
+          }
+          
+          const isActive = activeTab === item.id;
+          return (
+            <button
+              key={item.id}
+              onClick={() => onTabChange(item.id)}
+              className={`flex flex-col items-center justify-center py-2 px-3 rounded-xl transition-all ${
+                isActive 
+                  ? 'text-emerald-400' 
+                  : 'text-slate-500'
+              }`}
+              data-testid={`bottom-nav-${item.id}`}
+            >
+              <div className="relative">
+                <item.icon className={`h-6 w-6 ${isActive ? 'scale-110' : ''} transition-transform`} />
+                {item.id === 'dashboard' && unreadNotifications > 0 && (
+                  <span className="absolute -top-1 -right-1 h-4 w-4 rounded-full bg-red-500 text-white text-[10px] flex items-center justify-center">
+                    {unreadNotifications > 9 ? '9+' : unreadNotifications}
+                  </span>
+                )}
+              </div>
+              <span className={`text-[10px] mt-1 font-medium ${isActive ? 'text-emerald-400' : 'text-slate-500'}`}>
+                {item.label}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </nav>
+  );
+}
+
+// ============ PULL TO REFRESH ============
+function usePullToRefresh(onRefresh) {
+  const [refreshing, setRefreshing] = useState(false);
+  const startY = useRef(0);
+  const currentY = useRef(0);
+  
+  useEffect(() => {
+    let ticking = false;
+    
+    const handleTouchStart = (e) => {
+      if (window.scrollY === 0) {
+        startY.current = e.touches[0].clientY;
+      }
+    };
+    
+    const handleTouchMove = (e) => {
+      if (startY.current === 0) return;
+      currentY.current = e.touches[0].clientY;
+    };
+    
+    const handleTouchEnd = async () => {
+      const pullDistance = currentY.current - startY.current;
+      if (pullDistance > 100 && window.scrollY === 0 && !refreshing) {
+        setRefreshing(true);
+        try {
+          await onRefresh();
+        } finally {
+          setRefreshing(false);
+        }
+      }
+      startY.current = 0;
+      currentY.current = 0;
+    };
+    
+    document.addEventListener('touchstart', handleTouchStart, { passive: true });
+    document.addEventListener('touchmove', handleTouchMove, { passive: true });
+    document.addEventListener('touchend', handleTouchEnd);
+    
+    return () => {
+      document.removeEventListener('touchstart', handleTouchStart);
+      document.removeEventListener('touchmove', handleTouchMove);
+      document.removeEventListener('touchend', handleTouchEnd);
+    };
+  }, [onRefresh, refreshing]);
+  
+  return refreshing;
+}
+
+// ============ SHARE FUNCTIONALITY ============
+async function shareApp() {
+  const shareData = {
+    title: 'Talentos Financeiro',
+    text: 'Gerencie suas finanças com o Talentos!',
+    url: window.location.origin,
+  };
+
+  if (navigator.share && navigator.canShare(shareData)) {
+    try {
+      await navigator.share(shareData);
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.error('Error sharing:', err);
+      }
+    }
+  } else {
+    // Fallback: copy to clipboard
+    try {
+      await navigator.clipboard.writeText(window.location.origin);
+      alert('Link copiado!');
+    } catch (err) {
+      console.error('Could not copy:', err);
+    }
+  }
+}
+
 const formatCurrency = (value) => {
   return new Intl.NumberFormat("pt-BR", {
     style: "currency",
