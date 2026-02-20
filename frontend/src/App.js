@@ -1105,7 +1105,7 @@ function Dashboard({ user, onLogout }) {
       </aside>
 
       {/* Main Content */}
-      <main className="lg:ml-72 min-h-screen">
+      <main className="lg:ml-72 min-h-screen pb-20 md:pb-0">
         <header className="sticky top-0 z-30 bg-slate-950/95 backdrop-blur-lg border-b border-slate-800">
           <div className="flex items-center justify-between p-4">
             <div className="flex items-center gap-4">
